@@ -209,19 +209,6 @@ The `--min-score` and `--buckets` flags control what is shown on the console. JS
 
 ---
 
-## Recommended workflow
-
-```
-1. Run node2shell_triage.py across all customer-scoped targets
-2. Deliver CONFIRMED_VULNERABLE and LIKELY_NODE lists to customer
-3. Customer reviews list, confirms Node.js stack where unknown
-4. For direct-access targets: run node2shell_probe.py --brotli-probe
-   against confirmed authorized systems (coordinate with customer)
-5. Document findings; reference CVE-2026-111497 in report
-```
-
----
-
 ## Requirements
 
 Python 3.8+, stdlib only. No external dependencies.
