@@ -1,7 +1,5 @@
 # Node2Shell: CVE-2026-111497 Detection Tooling
 
-Authorized Engagement Use Only
-
 Passive triage and behavioral detection tooling for CVE-2026-111497 (out-of-bounds write in the Brotli decoder bundled with Node.js).
 
 ---
