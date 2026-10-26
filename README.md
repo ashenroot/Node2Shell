@@ -123,6 +123,65 @@ python3 node2shell_probe.py https://target.example.com --brotli-probe
 
 ---
 
+## Understanding the scoring system
+
+The scanner uses a point-based triage model designed around a core question: *how much does this signal actually constrain the attack surface?* High-weight signals are the ones that are nearly impossible to fake or coincidentally produce, or that directly indicate the specific exposure path for CVE-2026-111497.
+
+### Why each signal is weighted the way it is
+
+**`X-Powered-By: Express` (+40 — LIKELY threshold alone)**
+Express sets this header by default and most production deployments leave it in place. Its presence is the single strongest passive indicator that Node.js is serving the request — and since Express 5 enables Brotli body decompression by default, this header directly implicates the attack surface. A target with this header and nothing else crosses into `LIKELY_NODE` because the odds of a non-Node.js backend emitting `X-Powered-By: Express` are negligibly small.
+
+**`node` in Server / X-Powered-By (+30)**
+Catches backends that disclose `node` explicitly (e.g. `Server: Node.js/22.1.0`, `X-Powered-By: node`). Weighted slightly below Express because it's occasionally templated into reverse proxy headers or load balancer strings without Node.js actually serving the request, but still a very high-confidence signal.
+
+**`connect.sid` cookie (+20)**
+The default session cookie name set by Express's `connect` session middleware. Applications that have explicitly renamed their session cookie won't emit this, so it's not definitive — but when present it's a strong corroborating signal that Express is handling sessions, and therefore that the full Express 5 / Brotli stack is likely in play.
+
+**Brotli response encoding (+15)**
+`Content-Encoding: br` means the backend is actively serving compressed Brotli responses. This is more diagnostic than just "Node.js is present" — it means the Brotli codec path is exercised, which is the same code path CVE-2026-111497 lives in. Worth noting: Nginx, Caddy, and other proxies can inject Brotli encoding, so this alone doesn't confirm Node.js, but in combination with other signals it's highly meaningful.
+
+**Express-style weak ETag (+15)**
+Express generates ETags in the format `W/"<hex-length>-<hex-hash>"` (e.g. `W/"6-lJr4pHWBM4"`). This pattern is distinctive enough to be a useful corroborating signal but weak enough on its own that it only matters in combination.
+
+**Node.js keywords in body (+10)**
+Version strings, package names, or framework identifiers found in the response body — typically from a `/version`, `/health`, or similar endpoint. Lower weight because response bodies vary enormously and this can pick up documentation pages or error messages that mention Node.js tangentially.
+
+**Interesting disclosure paths (+5)**
+Non-404 responses to version/health endpoints like `/version`, `/health`, `/api/info`, `/metrics`. These endpoints exist, which is useful to know, but the content they return is captured in the body signal above. The path signal itself is a weak hint that an instrumented Node.js app may be present.
+
+### How buckets work
+
+The scoring path only runs when no version string is found. If a version is disclosed — from any header, response body, or disclosure path — the result goes directly to `CONFIRMED_VULNERABLE` or `CONFIRMED_PATCHED` based on the threshold table, bypassing scoring entirely.
+
+For scored results:
+- **LIKELY_NODE (≥ 40):** At least one high-confidence structural indicator. The `Express` header alone gets you here. This is the tier to prioritize for customer follow-up and credentialed scanning.
+- **POSSIBLE_NODE (≥ 10, < 40):** Weaker or more ambiguous signals. Worth logging but don't block a report on these without corroboration.
+- **UNLIKELY (< 10):** No meaningful Node.js indicators. Keep in the output so you can account for all scanned targets.
+
+### Worked examples
+
+| Signals observed | Score | Bucket |
+|---|---|---|
+| Version disclosed: Node 22.1.0 | — | `CONFIRMED_VULNERABLE` (bypasses scoring) |
+| Express header only | 40 | `LIKELY_NODE` |
+| Express + connect.sid | 60 | `LIKELY_NODE` |
+| Brotli encoding + ETag pattern | 30 | `POSSIBLE_NODE` |
+| Node keyword in body only | 10 | `POSSIBLE_NODE` |
+| No signals detected | 0 | `UNLIKELY` |
+
+### Using `--min-score` effectively
+
+The default (no filter) is usually the right starting point — let the scan run over everything and use `--min-score` to tighten the reported feed for a specific workflow:
+
+- `--min-score 40`: equivalent to "only LIKELY_NODE and above" in the scored tier (version-confirmed still passes)
+- `--min-score 25`: cuts low-confidence POSSIBLE_NODE results (Brotli + ETag) while keeping those with a corroborating body signal
+- `--min-score 10`: default behavior for scored results, all signals pass
+
+Version-confirmed results always pass regardless of `--min-score`. You won't accidentally suppress a `CONFIRMED_VULNERABLE` by setting a high threshold.
+
+---
+
 ## Instrumentation switches
 
 ### `--min-score N`
