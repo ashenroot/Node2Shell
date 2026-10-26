@@ -326,7 +326,7 @@ def collect_signals(host, port, use_tls, timeout):
                         break
                 # Also check for Express default 404 text
                 if "cannot get" in b404_text.lower() or "not found" in b404_text.lower():
-                    if "express" in b404_text.lower() or h404.get("x-powered-by", ""):
+                    if "express" in b404_text.lower() or "express" in h404.get("x-powered-by", "").lower():
                         signals["express_header"] = True
 
     # --- Version path sweep ---
