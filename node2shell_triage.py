@@ -158,7 +158,12 @@ def http_get(host, port, use_tls, path, timeout=8, method="GET"):
             sock = _tls_ctx.wrap_socket(sock, server_hostname=host)
         sock.sendall(req)
         buf = b""
+        deadline = time.monotonic() + timeout
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
             chunk = sock.recv(8192)
             if not chunk:
                 break
@@ -622,13 +627,16 @@ def worker(q, results, lock, timeout, verbose, min_score, bucket_filter):
     while True:
         item = q.get()
         if item is None:
+            q.task_done()
             break
-        r = scan_target(item, timeout=timeout)
-        with lock:
-            results.append(r)
-            if passes_filters(r, min_score, bucket_filter):
-                print_result(r, verbose=verbose)
-        q.task_done()
+        try:
+            r = scan_target(item, timeout=timeout)
+            with lock:
+                results.append(r)
+                if passes_filters(r, min_score, bucket_filter):
+                    print_result(r, verbose=verbose)
+        finally:
+            q.task_done()
 
 
 # ---------------------------------------------------------------------------
