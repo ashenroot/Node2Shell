@@ -196,6 +196,80 @@ def http_get(host, port, use_tls, path, timeout=8, method="GET"):
         return None, {}, b"", int((time.monotonic() - t0) * 1000), str(e)
 
 
+def http_get_follow(host, port, use_tls, path, timeout=8, method="GET", max_redirects=3):
+    """
+    Wrapper around http_get that follows up to max_redirects Location hops.
+
+    Returns (status_code, headers_dict, body_bytes, latency_ms, error, redirect_chain)
+    where redirect_chain is a list of strings describing each hop taken,
+    e.g. ["/api/version (307)", "/api/myself (200)"].
+
+    Relative Location values are resolved against the current host/port/scheme.
+    Cross-origin redirects (different host) are followed but annotated with
+    the full destination URL so the caller can see the chain clearly.
+    """
+    chain = []
+    cur_host = host
+    cur_port = port
+    cur_tls  = use_tls
+    cur_path = path
+    total_lat = 0
+
+    for _ in range(max_redirects + 1):
+        code, hdrs, body, lat, err = http_get(
+            cur_host, cur_port, cur_tls, cur_path, timeout=timeout, method=method)
+        total_lat += lat
+
+        if err or code is None:
+            return code, hdrs, body, total_lat, err, chain
+
+        chain.append(f"{cur_path} ({code})")
+
+        if code not in (301, 302, 303, 307, 308):
+            # Final destination reached
+            return code, hdrs, body, total_lat, err, chain
+
+        location = hdrs.get("location", "").strip()
+        if not location:
+            # 3xx with no Location — treat as final
+            return code, hdrs, body, total_lat, err, chain
+
+        # Parse the Location value
+        if location.startswith("http://") or location.startswith("https://"):
+            # Absolute URL — may be cross-origin
+            new_tls = location.startswith("https://")
+            rest = location[len("https://"):] if new_tls else location[len("http://"):]
+            slash = rest.find("/")
+            if slash == -1:
+                new_host_port = rest
+                new_path = "/"
+            else:
+                new_host_port = rest[:slash]
+                new_path = rest[slash:]
+            if ":" in new_host_port:
+                new_host, new_port_s = new_host_port.rsplit(":", 1)
+                try:
+                    new_port = int(new_port_s)
+                except ValueError:
+                    new_port = 443 if new_tls else 80
+            else:
+                new_host = new_host_port
+                new_port = 443 if new_tls else 80
+            if new_host != cur_host:
+                # Cross-origin — annotate and follow
+                chain[-1] = chain[-1].rstrip(")") + f" → {location})"
+            cur_host = new_host
+            cur_port = new_port
+            cur_tls  = new_tls
+            cur_path = new_path
+        else:
+            # Relative path
+            cur_path = location if location.startswith("/") else f"/{location}"
+
+    # Exhausted redirect budget — return last response as-is
+    return code, hdrs, body, total_lat, None, chain
+
+
 def parse_version(s):
     m = re.search(r'(\d+)\.(\d+)\.(\d+)', s)
     return tuple(int(x) for x in m.groups()) if m else None
@@ -237,13 +311,16 @@ def collect_signals(host, port, use_tls, timeout):
         "disclosure_path":       None,   # path where version was disclosed
         "raw_headers_sample":    {},     # first few interesting headers
         "interesting_paths":     [],     # non-404 paths found during sweep
+        "redirect_chain":        [],     # redirect hops seen during base GET /
         "latency_ms":            None,
         "http_status":           None,
         "error":                 None,
     }
 
-    # --- Base GET ---
-    code, hdrs, body, lat, err = http_get(host, port, use_tls, "/", timeout=timeout)
+    # --- Base GET (follow redirects to catch Node headers behind a redirect) ---
+    code, hdrs, body, lat, err, rchain = http_get_follow(host, port, use_tls, "/", timeout=timeout)
+    if len(rchain) > 1:
+        signals["redirect_chain"] = rchain
     signals["latency_ms"] = lat
     signals["http_status"] = code
 
@@ -337,7 +414,7 @@ def collect_signals(host, port, use_tls, timeout):
     # --- Version path sweep ---
     if not signals["node_version"]:
         for vpath in VERSION_PATHS:
-            vc, vh, vb, _, ve = http_get(
+            vc, vh, vb, _, ve, vchain = http_get_follow(
                 host, port, use_tls, vpath,
                 timeout=max(3, timeout // 2))
             if ve or vc in (404, 403, 405, None):
@@ -346,8 +423,13 @@ def collect_signals(host, port, use_tls, timeout):
             # for every path; these are not API endpoints and produce false positives
             if "text/html" in vh.get("content-type", ""):
                 continue
+            # Annotate with redirect chain if hops occurred
+            if len(vchain) > 1:
+                path_label = f"{vpath} ({' → '.join(vchain)})"
+            else:
+                path_label = f"{vpath} ({vc})"
             # Interesting path found
-            signals["interesting_paths"].append(f"{vpath} ({vc})")
+            signals["interesting_paths"].append(path_label)
             vb_text = vb[:8192].decode("utf-8", errors="replace")
             # Try version extraction
             for pat in NODE_VERSION_PATTERNS:
@@ -575,6 +657,7 @@ def write_csv(results, path):
             "latency_ms":         sigs.get("latency_ms", ""),
             "http_status":        sigs.get("http_status", ""),
             "interesting_paths":  " | ".join(sigs.get("interesting_paths", [])),
+            "redirect_chain":     " → ".join(sigs.get("redirect_chain", [])),
             "error":              sigs.get("error", ""),
             "scanned_at":         r.get("scanned_at", ""),
         })
