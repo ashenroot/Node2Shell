@@ -342,6 +342,10 @@ def collect_signals(host, port, use_tls, timeout):
                 timeout=max(3, timeout // 2))
             if ve or vc in (404, 403, 405, None):
                 continue
+            # Skip HTML responses — SPA catch-all routing returns 200 text/html
+            # for every path; these are not API endpoints and produce false positives
+            if "text/html" in vh.get("content-type", ""):
+                continue
             # Interesting path found
             signals["interesting_paths"].append(f"{vpath} ({vc})")
             vb_text = vb[:8192].decode("utf-8", errors="replace")
